@@ -27,11 +27,20 @@ def bench_main(workload_fn):
     timings_ns = []
     result = None
 
-    for _ in range(iters):
+    for i in range(iters):
         start = time.perf_counter_ns()
-        result = workload_fn(n, seed)
+        r = workload_fn(n, seed)
         elapsed = time.perf_counter_ns() - start
         timings_ns.append(elapsed)
+
+        if result is None:
+            result = r
+        elif r != result:
+            print(
+                f"ERROR: result mismatch at iter {i}: expected {result}, got {r}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     # Best-effort RSS (KiB on Linux, bytes/1024 on macOS).
     rss_kb = 0
