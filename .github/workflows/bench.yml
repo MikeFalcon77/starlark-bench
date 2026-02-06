@@ -1,0 +1,64 @@
+name: Benchmark smoke test
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: Smoke test — starlark (all workloads, size S)
+        shell: bash
+        run: |
+          for wl in arithmetic data_structures string_parsing json_building function_calls; do
+            cargo run --release --bin bench -- \
+              --engine starlark --workload "$wl" --size S --iters 1 --warmup 1
+          done
+
+      - name: Smoke test — python (all workloads, size S)
+        shell: bash
+        run: |
+          for wl in arithmetic data_structures string_parsing json_building function_calls; do
+            cargo run --release --bin bench -- \
+              --engine python --workload "$wl" --size S --iters 1 --warmup 1
+          done
+
+      - name: Verify checksums match
+        shell: bash
+        run: |
+          PYTHON=python3
+          if [[ "$RUNNER_OS" == "Windows" ]]; then PYTHON=python; fi
+          for wl in arithmetic data_structures string_parsing json_building function_calls; do
+            star=$(cargo run --release --bin bench -- \
+              --engine starlark --workload "$wl" --size S --iters 1 --warmup 0 \
+              2>/dev/null | $PYTHON -c "import sys,json; print(json.loads(sys.stdin.readline())['result'])")
+            py=$(cargo run --release --bin bench -- \
+              --engine python --workload "$wl" --size S --iters 1 --warmup 0 \
+              --python $PYTHON 2>/dev/null \
+              | $PYTHON -c "import sys,json; print(json.loads(sys.stdin.readline())['result'])")
+            if [ "$star" = "$py" ]; then
+              echo "OK  $wl  checksum=$star"
+            else
+              echo "FAIL $wl  starlark=$star  python=$py"
+              exit 1
+            fi
+          done
