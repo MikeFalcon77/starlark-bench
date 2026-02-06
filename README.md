@@ -77,6 +77,9 @@ Optional:
   --seed <N>                 RNG seed [default: 42]
   --python <PATH>            Python binary [default: python3]
   --scripts-dir <PATH>       Scripts root [default: ./scripts]
+  --reuse-module             (Starlark only) Reuse the same Module across iterations
+                             instead of creating a fresh one each time. Reports
+                             engine as "starlark-reuse". [default: false]
 ```
 
 ### Examples
@@ -119,10 +122,12 @@ Key fields:
 |---|---|
 | `eval_ns` | **Primary metric.** Workload execution time in nanoseconds. For Starlark this is `eval_function` wall time; for Python it is `time.perf_counter_ns()` measured inside the script. |
 | `parse_ns` | Starlark only, first iteration only. Time to parse the AST (not included in `eval_ns`). |
-| `total_ns` | For Starlark: equals `eval_ns`. For Python: full subprocess wall time divided by iteration count (includes startup). |
+| `wall_ns` | Per-iteration wall-clock time measured from Rust (ns). Comparable across engines. Includes per-iteration overhead (Module setup for Starlark, subprocess-amortized wall time for Python). |
+| `total_ns` | **Legacy.** For Starlark: equals `eval_ns`. For Python: subprocess wall time / iter count. Prefer `wall_ns` or `eval_ns` for cross-engine comparisons. |
 | `result` | Checksum. Must be identical across engines for the same `(workload, n, seed)`. |
 | `warmup` | `true` for warmup iterations. Filter these out for analysis. |
-| `rss_kb` | Resident set size in KiB (absolute). Starlark: host process RSS. Python: `resource.getrusage` max RSS. |
+| `rss_kb` | Resident set size in KiB (engine-local, **not** comparable across engines). Starlark: host process VmRSS. Python: `getrusage` max RSS. |
+| `rss_note` | Optional. Describes the RSS measurement method for this engine. |
 
 ## Chart generation
 
@@ -175,11 +180,13 @@ One subplot per size. Median `eval_ns` across measurement iterations, displayed 
 
 7. **Arbitrary-precision integers.** Both Starlark and CPython use big integers. The benchmark tests interpreter dispatch overhead, not native arithmetic throughput. All intermediate values are reduced modulo 2^31.
 
+8. **Fresh Module per iteration (default).** Each Starlark iteration creates a new `Module`, imports the frozen symbols, then times only `eval_function`. This measures isolated execution with no cross-iteration heap accumulation. Use `--reuse-module` for "hot interpreter" mode where the same Module (and its heap) persists across iterations.
+
 ## Interpretation pitfalls
 
-- **Don't compare `total_ns` across engines.** Python's `total_ns` includes ~35ms subprocess startup. Compare `eval_ns` to `eval_ns`.
-- **RSS is approximate.** Starlark's RSS is the host process VmRSS (Linux) which includes the Rust runtime. Python's is `getrusage` max RSS. They are not directly comparable.
-- **Size L on `json_building` is slow.** It builds 2.5M nested JSON objects via string concatenation. Expect multi-second runtimes. Start with M.
+- **Don't compare `total_ns` across engines.** The `total_ns` field is a legacy metric with different semantics per engine. Use `wall_ns` for cross-engine wall-clock comparisons, or `eval_ns` for pure workload execution comparisons.
+- **RSS is engine-local only.** Starlark's `rss_kb` is the full host process VmRSS (includes the Rust runtime and all allocations). Python's `rss_kb` is `getrusage` max RSS of the subprocess. These numbers have different baselines and cannot be subtracted or divided to get a meaningful ratio. Compare each engine's RSS trend across sizes, not across engines.
+- **Size L on `json_building` may be killed by OOM.** This workload builds millions of temporary strings and nested structures. Starlark's bump allocator never frees memory within a Module — each iteration allocates a fresh ~50–120 MB heap, and the OS may not reclaim the previous Module's pages fast enough. On memory-constrained environments (WSL2, CI runners, small VMs) the process can be killed by the OOM killer (exit code 137) after 2–3 iterations. Workarounds: use `--iters 1 --warmup 1`, run with `--size M` instead, or increase available RAM/swap. The first cold iteration is also 3–5x slower than steady state due to bump allocator growth.
 - **First Python iteration in a batch may be slower** due to function compilation (Python's internal peephole optimizer). Filter `iter == 0` or use warmup.
 - **Always use release builds.** The starlark crate is dramatically slower in debug mode. Never benchmark with `cargo run` without `--release`.
 

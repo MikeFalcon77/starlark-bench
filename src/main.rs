@@ -47,6 +47,11 @@ struct Cli {
     /// Root directory for workload scripts.
     #[arg(long)]
     scripts_dir: Option<PathBuf>,
+
+    /// (Starlark only) Reuse the same Module across iterations instead of
+    /// creating a fresh one each time. Measures "hot interpreter" performance.
+    #[arg(long, default_value_t = false)]
+    reuse_module: bool,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -138,12 +143,21 @@ struct BenchRecord {
     parse_ns: Option<u64>,
     /// Time spent evaluating the workload (nanoseconds).
     eval_ns: u64,
-    /// Wall-clock time including overhead (nanoseconds).
+    /// Per-iteration wall-clock time measured from Rust (nanoseconds).
+    /// Comparable across engines. Includes per-iteration overhead
+    /// (Module setup for Starlark, subprocess-amortized wall time for Python).
+    wall_ns: u64,
+    /// Legacy: for Starlark == eval_ns; for Python == subprocess wall / iter count.
+    /// Prefer wall_ns or eval_ns for cross-engine comparisons.
     total_ns: u64,
     /// Checksum returned by the workload (for correctness verification).
     result: i64,
     /// Resident set size in KiB (best-effort, 0 if unavailable).
+    /// Engine-local only — not comparable across engines.
     rss_kb: u64,
+    /// Describes the RSS measurement method for this engine.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rss_note: Option<String>,
     cpu_model: String,
     os: String,
     rustc: String,
@@ -278,14 +292,22 @@ mod starlark_engine {
         })
     }
 
-    fn extract_i64(value: Value) -> i64 {
+    fn extract_i64(value: Value) -> Result<i64> {
         if value.is_none() {
-            0
-        } else if let Some(i) = value.unpack_i32() {
-            i64::from(i)
-        } else {
-            value.to_repr().parse::<i64>().unwrap_or(0)
+            return Ok(0);
         }
+        if let Some(i) = value.unpack_i32() {
+            return Ok(i64::from(i));
+        }
+        // Starlark big integers render as decimal strings via to_repr().
+        let repr = value.to_repr();
+        repr.parse::<i64>().map_err(|_| {
+            anyhow!(
+                "workload returned unexpected type: got {}, repr = {:?}",
+                value.get_type(),
+                repr
+            )
+        })
     }
 
     /// Call the frozen `run(n, seed)` function once, measuring only eval time.
@@ -306,10 +328,42 @@ mod starlark_engine {
             .map_err(|e| anyhow!("starlark eval error: {e}"))?;
         let eval_dur = eval_start.elapsed();
 
-        let result = extract_i64(value);
+        let result = extract_i64(value)?;
         std::hint::black_box(result);
 
         Ok(RunResult { eval_dur, result })
+    }
+
+    /// Call `run(n, seed)` reusing an existing Module (hot-interpreter mode).
+    /// The Module retains heap state from previous calls.
+    pub fn call_run_reuse(
+        prepared: &PreparedScript,
+        module: &Module,
+        n: usize,
+        seed: u64,
+    ) -> Result<RunResult> {
+        let mut eval = Evaluator::new(module);
+
+        let heap = module.heap();
+        let n_val = heap.alloc(n as i64);
+        let seed_val = heap.alloc(seed as i64);
+        let func: Value = prepared.run_fn.value();
+
+        let eval_start = Instant::now();
+        let value = eval
+            .eval_function(func, &[n_val, seed_val], &[])
+            .map_err(|e| anyhow!("starlark eval error: {e}"))?;
+        let eval_dur = eval_start.elapsed();
+
+        let result = extract_i64(value)?;
+        std::hint::black_box(result);
+
+        Ok(RunResult { eval_dur, result })
+    }
+
+    /// Access the frozen module (for creating shared Modules in reuse mode).
+    pub fn frozen(prepared: &PreparedScript) -> &FrozenModule {
+        &prepared.frozen
     }
 }
 
@@ -474,15 +528,35 @@ fn run_starlark(
     let prepared = starlark_engine::prepare(&script_body)?;
     let parse_ns = prepared.parse_dur.as_nanos() as u64;
 
+    // In reuse-module mode, create one Module for all iterations.
+    let shared_module = if cli.reuse_module {
+        let m = starlark::environment::Module::new();
+        m.import_public_symbols(starlark_engine::frozen(&prepared));
+        Some(m)
+    } else {
+        None
+    };
+
+    let engine_label: String = if cli.reuse_module {
+        "starlark-reuse".into()
+    } else {
+        "starlark".into()
+    };
+
     for i in 0..total_iters {
         let is_warmup = i < cli.warmup;
 
-        let r = starlark_engine::call_run(&prepared, n, cli.seed)?;
-
+        let wall_start = std::time::Instant::now();
+        let r = if let Some(ref module) = shared_module {
+            starlark_engine::call_run_reuse(&prepared, module, n, cli.seed)?
+        } else {
+            starlark_engine::call_run(&prepared, n, cli.seed)?
+        };
         let rss = process_rss_kb();
+        let wall_ns = wall_start.elapsed().as_nanos() as u64;
 
         let record = BenchRecord {
-            engine: "starlark".into(),
+            engine: engine_label.clone(),
             workload: stem.into(),
             size: cli.size.to_string(),
             n,
@@ -491,9 +565,11 @@ fn run_starlark(
             warmup: is_warmup,
             parse_ns: if i == 0 { Some(parse_ns) } else { None },
             eval_ns: r.eval_dur.as_nanos() as u64,
+            wall_ns,
             total_ns: r.eval_dur.as_nanos() as u64,
             result: r.result,
             rss_kb: rss,
+            rss_note: Some("host-process VmRSS; includes Rust runtime".into()),
             cpu_model: cpu.into(),
             os: os.into(),
             rustc: rustc.into(),
@@ -524,7 +600,7 @@ fn run_python(
 
     // Helper to emit records from a python run.
     let emit = |pr: &python_engine::RunResult, warmup: bool| -> Result<()> {
-        let avg_total_ns = pr.total_dur.as_nanos() as u64
+        let per_iter_wall_ns = pr.total_dur.as_nanos() as u64
             / u64::from(pr.iters.len().max(1) as u32);
         for (j, ir) in pr.iters.iter().enumerate() {
             let record = BenchRecord {
@@ -537,9 +613,11 @@ fn run_python(
                 warmup,
                 parse_ns: None,
                 eval_ns: ir.eval_dur.as_nanos() as u64,
-                total_ns: avg_total_ns,
+                wall_ns: per_iter_wall_ns,
+                total_ns: per_iter_wall_ns,
                 result: ir.result,
                 rss_kb: pr.rss_kb,
+                rss_note: Some("getrusage maxrss; subprocess only".into()),
                 cpu_model: cpu.into(),
                 os: os.into(),
                 rustc: rustc.into(),
